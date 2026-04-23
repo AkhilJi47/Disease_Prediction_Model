@@ -38,5 +38,14 @@ if __name__ == '__main__':
 
     # Load pre-trained model
     clf = load(str("./saved_model/random_forest.joblib"))
-    result = clf.predict(df_test)
-    print(f"Predicted Disease: {result}")
+    probs = clf.predict_proba(df_test)[0]
+
+# get top 3 predictions
+top3_idx = probs.argsort()[-3:][::-1]
+
+print("\nTop Disease Predictions:\n")
+
+for i in top3_idx:
+    disease = clf.classes_[i]
+    confidence = probs[i] * 100
+    print(f"{disease} : {confidence:.2f}%")

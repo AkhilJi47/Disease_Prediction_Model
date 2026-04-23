@@ -23,7 +23,7 @@ model:
 
   # Random Forest Classifier
   random_forest:
-    n_estimators: 10
+  n_estimators: 300
 
   # Gradient Boosting Classifier
   gradient_boost:
