@@ -1,3 +1,4 @@
+# client = genai.Client(api_key="AQ.Ab8RN6LahM_wS0wgPM8ShZdDJxD2u60xtYivBWG9oHOn9pCKwA")
 import pandas as pd
 import gradio as gr
 from joblib import load
@@ -6,7 +7,7 @@ from google import genai
 # ==========================================
 # GEMINI CLIENT
 # ==========================================
-client = genai.Client(api_key="AIzaSyARJ5v9N99NwtkDtZZ0iPmEO5jJgjkgU-o")
+client = genai.Client(api_key="AQ.Ab8RN6LahM_wS0wgPM8ShZdDJxD2u60xtYivBWG9oHOn9pCKwA")
 
 # ==========================================
 # LOAD DATA
@@ -81,7 +82,7 @@ Short concise answer
 """
 
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.6-flash",
             contents=prompt
         )
 
@@ -149,7 +150,7 @@ User message: {message}
 """
 
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.6-flash",
             contents=prompt
         )
 
