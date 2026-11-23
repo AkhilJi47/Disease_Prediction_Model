@@ -12,7 +12,7 @@ from joblib import load
 # CONFIG
 # ==========================================
 MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-client = genai.Client(api_key="AQ.Ab8RN6Jy8F9q-Y8_PBFaerPbxrW_-9bYlgT8o5puvE0HPsE5wA")
+client = genai.Client(api_key="AQ.Ab8RN6KVwZPquTW9DZib0xUDepy1rz9Dm1hZlq1QyyzIiFHLeg")
 # client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
 df = pd.read_csv("./dataset/training_data.csv")
@@ -28,11 +28,31 @@ COMMON = ["fever", "high_fever", "cough", "headache", "fatigue", "vomiting", "na
           "breathlessness", "sore_throat", "runny_nose"]
 quick = [s for s in COMMON if s in symptom_index][:10]
 
-CHAT_SYSTEM = (
-    "You are My AMIGO, a warm, calm, empathetic AI health companion. "
-    "Use simple language, keep answers short, never diagnose, "
-    "and suggest seeing a doctor when it is appropriate."
-)
+CHAT_SYSTEM = """You are My AMIGO, a warm, calm AI health companion with strong medical-imaging knowledge.
+
+For TEXT-ONLY messages: use simple language, keep answers short, and suggest a doctor when appropriate.
+
+For IMAGES (medical scans such as CT, MRI, X-ray, ultrasound, or photos of skin, eyes, wounds, throat, etc.):
+Always analyze the image and answer in exactly this structure. Never refuse and never reply only with
+"I can't interpret this".
+
+**🖼️ Image type:** (what kind of image / view / body part)
+
+**🔍 What I observe:** 3-5 bullet points describing specific visible findings
+(location, shape, density/colour, symmetry, abnormal areas, highlighted regions).
+
+**🩺 Most likely conditions:** a ranked list of 2-4 possible conditions that fit these findings,
+each with a rough likelihood (High / Medium / Low) and a one-line reason.
+
+**🌿 What to do next:** 2-3 practical next steps (tests, specialist to see, self-care).
+
+**🚨 Seek urgent care if:** 2-3 warning signs relevant to the suspected conditions.
+
+**⚠️ Note:** one short sentence saying this is an AI-assisted estimate from a single image and
+must be confirmed by a doctor or radiologist.
+
+If the user also describes symptoms, combine them with the image findings.
+If the image is blurry, cropped, or not medical, say so kindly and ask for a clearer one."""
 
 # ==========================================
 # HTML SNIPPETS
@@ -127,31 +147,100 @@ def predict_disease(selected):
 # ==========================================
 # CHAT
 # ==========================================
-def _text(content):
+# ==========================================
+# CHAT (text + image upload)
+# ==========================================
+import mimetypes
+
+CHAT_SYSTEM = (
+    "You are My AMIGO, a warm, calm, empathetic AI health companion. "
+    "Use simple language, keep answers short, never give a definitive diagnosis, "
+    "and suggest seeing a doctor when it is appropriate. "
+    "When the user shares a photo (for example a rash, swelling, wound, eye, throat or skin issue), "
+    "describe what you visibly notice, list a few possible explanations, give simple self-care tips, "
+    "mention warning signs that need urgent care, and remind them you cannot diagnose from a picture. "
+    "If the image is unclear or not health related, say so kindly and ask for a clearer photo."
+)
+
+
+def _is_image(path):
+    return (mimetypes.guess_type(path)[0] or "").startswith("image/")
+
+
+def _image_part(path):
+    mime = mimetypes.guess_type(path)[0] or "image/jpeg"
+    with open(path, "rb") as f:
+        return types.Part.from_bytes(data=f.read(), mime_type=mime)
+
+
+def _to_parts(content):
+    """Convert any Gradio message content (str / dict / tuple / list) into Gemini parts."""
+    parts = []
+    if content is None:
+        return parts
     if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return " ".join(c.get("text", "") if isinstance(c, dict) else str(c) for c in content)
-    return str(content or "")
+        if os.path.isfile(content):                                   # uploaded file path -> real image
+            if _is_image(content):
+                parts.append(_image_part(content))
+        elif content.strip():
+            parts.append(types.Part(text=content))
+    elif isinstance(content, dict):
+        if isinstance(content.get("path"), str):                      # file component
+            if _is_image(content["path"]):
+                parts.append(_image_part(content["path"]))
+        elif isinstance(content.get("file"), dict):                   # older file format
+            parts += _to_parts(content["file"])
+        else:                                                         # {"text":..., "files":[...]}
+            parts += _to_parts(content.get("text"))
+            for f in content.get("files") or []:
+                parts += _to_parts(f)
+    elif isinstance(content, (list, tuple)):
+        for c in content:
+            parts += _to_parts(c)
+    elif hasattr(content, "path"):                                    # gradio FileData-like object
+        parts += _to_parts({"path": content.path})
+    return parts
 
 
 def chat_with_amigo(message, history):
     try:
         contents = []
-        for h in (history or [])[-12:]:
+
+        def add(role, parts):
+            if not parts:
+                return
+            if contents and contents[-1]["role"] == role:     # merge consecutive same-role turns
+                contents[-1]["parts"].extend(parts)
+            else:
+                contents.append({"role": role, "parts": parts})
+
+        for h in (history or [])[-16:]:
             if isinstance(h, dict):
                 role = "model" if h.get("role") == "assistant" else "user"
-                contents.append({"role": role, "parts": [{"text": _text(h.get("content"))}]})
+                add(role, _to_parts(h.get("content")))
             else:
                 u, b = h
-                if u: contents.append({"role": "user", "parts": [{"text": _text(u)}]})
-                if b: contents.append({"role": "model", "parts": [{"text": _text(b)}]})
-        contents.append({"role": "user", "parts": [{"text": message}]})
+                add("user", _to_parts(u))
+                add("model", _to_parts(b))
+
+        user_parts = _to_parts(message)
+        has_image = any(getattr(p, "inline_data", None) for p in user_parts)
+        has_text = any(getattr(p, "text", None) for p in user_parts)
+        if has_image and not has_text:
+            user_parts.insert(0, types.Part(
+                text="Please look at this photo and tell me what you notice about any possible symptoms."))
+        if not user_parts:
+            yield "Please type a message or upload a photo."
+            return
+        add("user", user_parts)
 
         acc = ""
         for chunk in client.models.generate_content_stream(
             model=MODEL_NAME, contents=contents,
-            config=types.GenerateContentConfig(system_instruction=CHAT_SYSTEM),
+            config=types.GenerateContentConfig(
+                system_instruction=CHAT_SYSTEM,
+                temperature=0.3,
+            )
         ):
             acc += chunk.text or ""
             yield acc
@@ -160,6 +249,83 @@ def chat_with_amigo(message, history):
     except Exception as e:
         yield f"Couldn't reach Gemini: {e}"
 
+# ==========================================
+# IMAGE ANALYZER (same result card as symptom checker)
+# ==========================================
+import json
+
+IMG_PROMPT = """You are the image-analysis module of a health education app.
+Look at the attached image (CT, MRI, X-ray, ultrasound, or a photo of skin, eye, throat, wound, etc.).
+Always give your best estimate and never refuse. Reply with ONLY raw JSON in exactly this format:
+
+{"image_type": "short name, e.g. Brain CT scan",
+ "findings": ["2-4 word visible finding", "2-4 word visible finding", "2-4 word visible finding"],
+ "predictions": [{"condition": "Common condition name", "probability": 50},
+                 {"condition": "Common condition name", "probability": 30},
+                 {"condition": "Common condition name", "probability": 20}]}
+
+Rules: exactly 3 predictions ranked from most to least likely, probabilities are whole numbers
+that add up to 100, condition names are short and in plain English, findings describe what is
+visibly seen in the image."""
+
+
+def loading_text(text):
+    return f"""
+    <div class="res"><div class="loading">
+        <div class="orb"><span></span><span></span><span></span></div>
+        <p class="load-text">{escape(text)}</p>
+        <div class="skel"></div><div class="skel short"></div><div class="skel"></div>
+    </div></div>"""
+
+
+def analyze_image(image_path, notes):
+    if not image_path:
+        yield notice("Upload an image first.")
+        return
+    try:
+        yield loading_text("Analyzing your image…")
+        prompt = IMG_PROMPT
+        if notes and notes.strip():
+            prompt += f"\n\nPatient notes: {notes.strip()}"
+
+        resp = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=[_image_part(image_path), types.Part(text=prompt)],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.2,
+            ),
+        )
+        raw = (resp.text or "").replace("```json", "").replace("```", "").strip()
+        data = json.loads(raw)
+
+        preds = [(str(p["condition"]), float(p["probability"])) for p in data["predictions"][:3]]
+        preds.sort(key=lambda x: x[1], reverse=True)
+        best = preds[0][0]
+        findings = data.get("findings", [])[:4]
+        if data.get("image_type"):
+            findings = [data["image_type"]] + findings
+
+        bars = "".join(
+            f'<div class="bar"><span>{escape(n)}</span>'
+            f'<div class="track"><i style="--w:{p:.0f}%"></i></div><b>{p:.0f}%</b></div>'
+            for n, p in preds
+        )
+        chips = "".join(f"<em>{escape(str(f))}</em>" for f in findings)
+
+        yield f"""
+        <div class="res">
+            <div class="hero-result spot tilt">
+                <p class="k">Closest match</p>
+                <h2 class="dz">{escape(best)}</h2>
+                <div class="chips">{chips}</div>
+                <div class="bars">{bars}</div>
+            </div>
+            <div class="note">⚠️ AI-assisted estimate from a single image. Not a medical diagnosis. Please confirm with a doctor or radiologist.</div>
+            <div class="ins-grid">{explain(best)}</div>
+        </div>"""
+    except Exception as e:
+        yield notice(f"Couldn't analyze the image: {e}")
 
 # ==========================================
 # HEAD: fonts + animated background + mouse magic
@@ -430,7 +596,7 @@ button[role="tab"][aria-selected="true"]{color:#fff!important;background:linear-
 # ==========================================
 # UI
 # ==========================================
-with gr.Blocks(css=css, head=head, title="My AMIGO") as app:
+with gr.Blocks(title="My AMIGO") as app:
     gr.HTML(HERO)
 
     with gr.Tabs():
@@ -458,17 +624,41 @@ with gr.Blocks(css=css, head=head, title="My AMIGO") as app:
             clear_btn.click(lambda: ([], ""), None, [symptom_selector, output])
 
         with gr.Tab("💬 Chat with AMIGO"):
-            gr.ChatInterface(
+                                                gr.ChatInterface(
                 fn=chat_with_amigo,
+                multimodal=True,
                 chatbot=gr.Chatbot(height=460, show_label=False),
-                textbox=gr.Textbox(placeholder="Ask anything about how you feel…", container=False, scale=7),
+                textbox=gr.MultimodalTextbox(
+                    placeholder="Describe how you feel, or upload a photo (rash, swelling, etc.)…",
+                    file_types=["image"],
+                    file_count="multiple",
+                    sources=["upload"],
+                    show_label=False,
+                ),
                 examples=[
-                    "I’ve had a headache since yesterday",
-                    "How can I sleep better?",
-                    "What should I eat when I have a cold?",
+                    {"text": "I’ve had a headache since yesterday"},
+                    {"text": "How can I sleep better?"},
+                    {"text": "What should I eat when I have a cold?"},
                 ],
                 cache_examples=False,
             )
 
+
+        with gr.Tab("🖼️ Image analyzer"):
+            with gr.Column(elem_classes="panel spot"):
+                gr.HTML('<h2 class="panel-title">Upload a scan or photo</h2>'
+                        '<p class="panel-sub">CT, MRI, X-ray, or a photo of a rash, eye, throat or wound.</p>')
+                img_input = gr.Image(type="filepath", label="Your image", height=320)
+                img_notes = gr.Textbox(label="Symptoms or notes (optional)",
+                                       placeholder="e.g. headache for 3 days, blurred vision")
+                with gr.Row():
+                    img_btn = gr.Button("✨ Analyze image", elem_classes="magnet", scale=3)
+                    img_clear = gr.Button("Clear", elem_classes="ghost", scale=1)
+
+            img_output = gr.HTML()
+
+            img_btn.click(analyze_image, [img_input, img_notes], img_output, show_progress="hidden")
+            img_clear.click(lambda: (None, "", ""), None, [img_input, img_notes, img_output])
+
 if __name__ == "__main__":
-    app.launch()
+    app.launch(css=css, head=head)
